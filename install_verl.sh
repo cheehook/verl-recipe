@@ -24,6 +24,12 @@
 #                        MODE=rolling_with_baseline -> rolling | baseline (default: rolling)
 #                        MODE=dapo reproduction    -> rolling | reproduction (default: rolling)
 #                      Ignored for other MODEs.
+#   --hardware-plugin NAME
+#                      Install for hardware that verl supports through verl-hardware-plugin,
+#                      e.g. intel (default: none, the plain install for NVIDIA and AMD GPUs).
+#                      Installs verl with --no-deps, then the versions the recipe pins for
+#                      NAME in REQUIRED_VERL.txt: <NAME>_PLUGIN_COMMIT, plus
+#                      <NAME>_TRANSFORMERS / <NAME>_KERNELS where set (e.g. INTEL_*).
 #   --dest DIR         Directory to clone verl into when --method git is used
 #                      (default: ./verl).
 #   --show             Print the resolved plan and exit without running anything.
@@ -44,9 +50,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
+# --hardware-plugin NAME: hardware verl supports through verl-hardware-plugin (e.g. intel),
+# which adds the platform to verl. Each recipe pins the versions it was tested with in
+# REQUIRED_VERL.txt; on Intel GPUs transformers with kernels provides flash_attention_2.
+# verl itself goes in with --no-deps there: its declared transformers range would downgrade
+# transformers, and the env's vendor builds of torch / vLLM must stay as they are.
+HARDWARE_PLUGIN_UPSTREAM="https://github.com/verl-project/verl-hardware-plugin.git"
+HW_PLUGIN=""  # set by --hardware-plugin
+
 print_help() {
-    # Print the banner comment (lines 2..41), stripping the leading `# ` / `#`.
-    sed -n '2,41p' "${BASH_SOURCE[0]}" | sed -E 's/^#( |$)//'
+    # Print the banner comment (lines 2..47), stripping the leading `# ` / `#`.
+    sed -n '2,47p' "${BASH_SOURCE[0]}" | sed -E 's/^#( |$)//'
 }
 
 log()  { printf '[install_verl] %s\n' "$*" >&2; }
@@ -250,12 +264,32 @@ install_via_pip() {
     fi
     pip_bin="$(detect_pip)"
     rewritten="$(rewrite_pip_cmd "$R_PIP_INSTALL" "$pip_bin")"
+    if [[ -n "$HW_PLUGIN" ]]; then
+        rewritten="${rewritten/"$pip_bin install "/"$pip_bin install --no-deps "}"
+    fi
     run_cmd "$rewritten"
+    install_plugin_packages "$pip_bin"
+}
+
+# --hardware-plugin only: install verl-hardware-plugin and the packages the recipe pins for
+# it (R_PLUGIN_COMMIT / R_PLUGIN_TRANSFORMERS / R_PLUGIN_KERNELS, read in main).
+install_plugin_packages() {
+    local pip_bin="$1" pkgs=""
+    if [[ -z "$HW_PLUGIN" ]]; then return 0; fi
+    # --no-deps: the plugin depends on verl, which would bring verl's transformers range back.
+    run_cmd "$pip_bin install --no-deps \"verl-hardware-plugin @ git+${HARDWARE_PLUGIN_UPSTREAM}@${R_PLUGIN_COMMIT}\""
+    [[ -n "$R_PLUGIN_TRANSFORMERS" ]] && pkgs+=" transformers==${R_PLUGIN_TRANSFORMERS}"
+    [[ -n "$R_PLUGIN_KERNELS" ]] && pkgs+=" kernels==${R_PLUGIN_KERNELS}"
+    if [[ -n "$pkgs" ]]; then
+        log "note: pip may report that verl requires an older transformers; that is expected here"
+        run_cmd "$pip_bin install${pkgs}"
+    fi
 }
 
 install_via_git() {
-    local dest="$1" pip_bin
+    local dest="$1" pip_bin no_deps=""
     pip_bin="$(detect_pip)"
+    if [[ -n "$HW_PLUGIN" ]]; then no_deps="--no-deps "; fi
 
     # If the recipe recorded a self-contained GIT_SETUP line, run that verbatim
     # (it already does clone + checkout + submodule init + cd, which is the
@@ -266,7 +300,8 @@ install_via_git() {
             log "note: ignoring recorded GIT_SETUP because --dest=$dest differs from its default"
         else
             run_cmd "$R_GIT_SETUP"
-            run_cmd "cd verl && $pip_bin install -e ."
+            run_cmd "cd verl && $pip_bin install ${no_deps}-e ."
+            install_plugin_packages "$pip_bin"
             return
         fi
     fi
@@ -282,7 +317,8 @@ install_via_git() {
     fi
     # Bring the recipe submodule to the matching revision so relative imports work.
     run_cmd "cd '$dest' && git submodule update --init --recursive recipe || true"
-    run_cmd "cd '$dest' && $pip_bin install -e ."
+    run_cmd "cd '$dest' && $pip_bin install ${no_deps}-e ."
+    install_plugin_packages "$pip_bin"
 }
 
 main() {
@@ -293,6 +329,7 @@ main() {
             --file)   file="${2:?}";   shift 2 ;;
             --method) method="${2:?}"; shift 2 ;;
             --option) option="${2:?}"; shift 2 ;;
+            --hardware-plugin) HW_PLUGIN="${2:?}"; shift 2 ;;
             --dest)   dest="${2:?}";   shift 2 ;;
             --show)   show=1; shift ;;
             --yes|-y) ASSUME_YES=1; shift ;;
@@ -316,11 +353,25 @@ main() {
     local R_MODE R_UPSTREAM R_COMMIT R_TAG R_PIP_INSTALL R_GIT_SETUP R_LABEL
     resolve_spec "$file" "$option"
 
+    # Pins for --hardware-plugin NAME use the prefix NAME in upper case, e.g. INTEL_PLUGIN_COMMIT.
+    local R_PLUGIN_COMMIT="" R_PLUGIN_TRANSFORMERS="" R_PLUGIN_KERNELS="" prefix
+    if [[ -n "$HW_PLUGIN" ]]; then
+        [[ "$HW_PLUGIN" =~ ^[a-z][a-z0-9_]*$ ]] || die "--hardware-plugin expects a name like intel (got '$HW_PLUGIN')"
+        prefix="${HW_PLUGIN^^}"
+        R_PLUGIN_COMMIT="$(get_field "$file" "${prefix}_PLUGIN_COMMIT")"
+        R_PLUGIN_TRANSFORMERS="$(get_field "$file" "${prefix}_TRANSFORMERS")"
+        R_PLUGIN_KERNELS="$(get_field "$file" "${prefix}_KERNELS")"
+        if [[ -z "$R_PLUGIN_COMMIT" ]]; then
+            die "$(printf '%s has no %s_PLUGIN_COMMIT: this recipe has not been tested with --hardware-plugin %s yet' "$file" "$prefix" "$HW_PLUGIN")"
+        fi
+    fi
+
     cat >&2 <<EOF
 [install_verl] file:     $file
 [install_verl] MODE:     $R_MODE
 [install_verl] upstream: $R_UPSTREAM
 [install_verl] resolved: $R_LABEL
+[install_verl] hardware plugin: ${HW_PLUGIN:-none}
 [install_verl] method:   $method
 [install_verl] pip line: ${R_PIP_INSTALL:-<none>}
 EOF
